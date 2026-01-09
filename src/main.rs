@@ -3,14 +3,14 @@
 // ==========================
 
 use axum::extract::ConnectInfo;
-use axum::http::{header::RANGE, HeaderMap};
+use axum::http::{HeaderMap, header::RANGE};
 use axum::{
+    Router,
     body::Body,
     extract::{Path as AxumPath, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Router,
 };
 
 use clap::Parser;
@@ -34,7 +34,7 @@ use tracing::info;
 #[command(version, about, long_about = None)]
 struct Args {
     /// root folder path of file server
-    #[arg(short, long, default_value_t = env::current_dir().unwrap().to_string_lossy().into_owned())]
+    #[arg(short, long, default_value_t = env::current_dir().expect("Default current directory is invalid").to_string_lossy().into_owned())]
     folder_path: String,
 
     /// port number
@@ -86,9 +86,20 @@ async fn main() {
         });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port_number));
-    println!("Server running at http://{}:{}",local_ip,args.port_number);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "Error: Could not bind to port {}.\nDetails: {}",
+                args.port_number, e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    println!("Server running at http://{}:{}", local_ip, args.port_number);
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -148,7 +159,9 @@ fn sanitize_path(path: &str) -> PathBuf {
 // ==========================
 
 async fn render_directory(dir: &Path, base: &str) -> impl IntoResponse {
-    let mut entries = tokio::fs::read_dir(dir).await.unwrap();
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .expect("Read dir in render_directory threw an unexpected error");
 
     let mut html = String::new();
     html.push_str("<html><body>");
@@ -238,11 +251,7 @@ async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Resp
 
             response_headers.insert(
                 header::CONTENT_RANGE,
-                HeaderValue::from_str(&format!(
-                    "bytes {}-{}/{}",
-                    start, end, file_size
-                ))
-                .unwrap(),
+                HeaderValue::from_str(&format!("bytes {}-{}/{}", start, end, file_size)).unwrap(),
             );
             response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
 
