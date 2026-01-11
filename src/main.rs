@@ -158,15 +158,44 @@ fn sanitize_path(path: &str) -> PathBuf {
 // Directory Rendering
 // ==========================
 
-async fn render_directory(dir: &Path, base: &str) -> impl IntoResponse {
+pub async fn render_directory(dir: &Path, base: &str) -> impl axum::response::IntoResponse {
+    // Read directory asynchronously
     let mut entries = tokio::fs::read_dir(dir)
         .await
-        .expect("Read dir in render_directory threw an unexpected error");
+        .expect("Failed to read directory");
 
+    // Preallocate Vec of HTML entries
+    let mut html_entries: Vec<String> = Vec::with_capacity(64);
+
+    // Collect HTML for each entry
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = if base.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", base, &name)
+        };
+
+        // Determine icon
+        let icon = if entry.file_type().await.is_ok_and(|ft| ft.is_dir()) {
+            "📁"
+        } else {
+            "📄"
+        };
+
+        let html_line = format!("<li>{} <a href=\"/files/{}\">{}</a></li>", icon, path, name);
+        html_entries.push(html_line);
+    }
+
+    // Sort the HTML entries alphabetically by path
+    html_entries.sort();
+
+    // Build full HTML page
     let mut html = String::new();
     html.push_str("<html><body>");
     html.push_str("<h1>Directory listing</h1><ul>");
 
+    // Add parent link if not root
     if !base.is_empty() {
         let parent = Path::new(base).parent().unwrap_or(Path::new(""));
         html.push_str(&format!(
@@ -175,25 +204,9 @@ async fn render_directory(dir: &Path, base: &str) -> impl IntoResponse {
         ));
     }
 
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let path = if base.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", base, name)
-        };
-
-        if entry.path().is_dir() {
-            html.push_str(&format!(
-                "<li>📁 <a href=\"/files/{}\">{}</a></li>",
-                path, name
-            ));
-        } else {
-            html.push_str(&format!(
-                "<li>📄 <a href=\"/files/{}\">{}</a></li>",
-                path, name
-            ));
-        }
+    // Append sorted entries
+    for entry in html_entries {
+        html.push_str(&entry);
     }
 
     html.push_str("</ul></body></html>");
