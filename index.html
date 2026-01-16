@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Wifi File Server</title>
+    <style>
+      :root {
+        --bg: #f6f8fa;
+        --border: #d0d7de;
+        --link: #0969da;
+      }
+      body {
+        font-family: -apple-system, sans-serif;
+        margin: 2rem;
+        background: var(--bg);
+        color: #1f2328;
+      }
+      .container {
+        max-width: 900px;
+        margin: auto;
+        background: white;
+        padding: 2rem;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+      }
+
+      /* Remove dots and style rows */
+      #file-list {
+        margin-top: 1rem;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: white;
+      }
+      .item-row {
+        display: flex;
+        align-items: center;
+        padding: 10px 15px;
+        border-bottom: 1px solid #f0f0f0;
+      }
+      .item-row:last-child {
+        border-bottom: none;
+      }
+      .item-row:hover {
+        background: #f9fafb;
+      }
+      .parent-row {
+        background: #fafafa;
+        font-size: 0.9rem;
+      }
+
+      .checkbox-wrapper {
+        margin-right: 12px;
+        display: flex;
+        align-items: center;
+      }
+      .icon {
+        margin-right: 10px;
+        width: 20px;
+        text-align: center;
+      }
+      .file-link {
+        color: var(--link);
+        text-decoration: none;
+        font-weight: 500;
+        flex-grow: 1;
+      }
+      .file-link:hover {
+        text-decoration: underline;
+      }
+
+      /* GitHub Style Code Section */
+      #curl-container {
+        display: none;
+        margin-top: 2rem;
+      }
+      .code-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        background: #161b22;
+        padding: 8px 16px;
+        border-radius: 6px 6px 0 0;
+        color: #8b949e;
+        font-size: 12px;
+        font-family: monospace;
+      }
+      .code-wrapper {
+        background: #0d1117;
+        padding: 16px;
+        border-radius: 0 0 6px 6px;
+        position: relative;
+      }
+      code {
+        color: #e6edf3;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+
+      .btn-copy {
+        background: #21262d;
+        border: 1px solid #30363d;
+        color: #c9d1d9;
+        cursor: pointer;
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      .btn-copy:hover {
+        background: #30363d;
+      }
+      .btn-copy.success {
+        color: #3fb950;
+        border-color: #3fb950;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>📁 File Server</h1>
+      <div
+        style="
+          padding: 10px;
+          background: #fff8c5;
+          border: 1px solid #d4a017;
+          border-radius: 6px;
+          margin-bottom: 1rem;
+          font-size: 13px;
+        "
+      >
+        <input type="checkbox" id="master-select" onclick="toggleAll(this)" />
+        <label for="master-select" style="cursor: pointer; font-weight: bold">
+          Select All Files in this Directory</label
+        >
+      </div>
+
+      <div id="file-list">{{CONTENT}}</div>
+
+      <div id="curl-container">
+        <div class="code-header">
+          <span>DOWNLOAD COMMAND</span>
+          <button class="btn-copy" id="copy-btn" onclick="copyCurl()">
+            Copy
+          </button>
+        </div>
+        <div class="code-wrapper">
+          <code id="curl-code"></code>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      function toggleAll(master) {
+        document
+          .querySelectorAll(".item-check")
+          .forEach((cb) => (cb.checked = master.checked));
+        updateCurl();
+      }
+
+      async function updateCurl() {
+        const checks = document.querySelectorAll(".item-check:checked");
+        const container = document.getElementById("curl-container");
+        const codeElement = document.getElementById("curl-code");
+
+        if (checks.length === 0) {
+          container.style.display = "none";
+          return;
+        }
+
+        let files = [];
+        let dirs = [];
+
+        checks.forEach((cb) => {
+          if (cb.dataset.isDir === "true") {
+            dirs.push(cb.dataset.path);
+          } else {
+            files.push(cb.dataset.path);
+          }
+        });
+
+        const response = await fetch("/register-selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ files, dirs }),
+        });
+
+        const { id } = await response.json();
+        const host = window.location.origin;
+        // The --base-url flag in curl tells curl to prepend the host to relative URLs in the config file
+        codeElement.innerText = `curl -s "${host}/config/${id}" | curl --create-dirs -K -`;
+        container.style.display = "block";
+      }
+
+      async function copyCurl() {
+        const code = document.getElementById("curl-code").innerText;
+        const btn = document.getElementById("copy-btn");
+        try {
+          await navigator.clipboard.writeText(code);
+          btn.innerText = "Copied!";
+          btn.classList.add("success");
+          setTimeout(() => {
+            btn.innerText = "Copy";
+            btn.classList.remove("success");
+          }, 2000);
+        } catch (err) {
+          // Fallback for non-https contexts
+          const el = document.createElement("textarea");
+          el.value = code;
+          document.body.appendChild(el);
+          el.select();
+          document.execCommand("copy");
+          document.body.removeChild(el);
+          btn.innerText = "Copied!";
+          setTimeout(() => {
+            btn.innerText = "Copy";
+          }, 2000);
+        }
+      }
+
+      let updateTimer = null;
+
+      document.addEventListener("change", (e) => {
+        if (!e.target.classList.contains("item-check")) return;
+
+        // debounce to avoid spamming server
+        clearTimeout(updateTimer);
+        updateTimer = setTimeout(updateCurl, 150);
+      });
+    </script>
+  </body>
+</html>

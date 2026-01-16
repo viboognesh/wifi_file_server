@@ -1,60 +1,79 @@
 // ==========================
 // Imports
 // ==========================
-
-use axum::extract::ConnectInfo;
-use axum::http::{HeaderMap, header::RANGE};
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
-    extract::{Path as AxumPath, State},
-    http::{HeaderValue, StatusCode, header},
+    extract::{ConnectInfo, Path as AxumPath, State},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{self, RANGE},
+    },
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
-
 use clap::Parser;
-
+use lru::LruCache;
+use serde::{Deserialize, Serialize};
 use std::{
     env,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
+    sync::{Arc, Mutex},
 };
-
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::{
+    fs::{self, File},
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+};
 use tokio_util::io::ReaderStream;
 use tracing::info;
+use unicase::UniCase;
+use uuid::Uuid;
 
 // ==========================
 // CLI Input Struct
 // ==========================
-
-/// Wifi file server tool
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// root folder path of file server
-    #[arg(short, long, default_value_t = env::current_dir().expect("Default current directory is invalid").to_string_lossy().into_owned())]
+    /// Root folder path of file server
+    #[arg(short, long, default_value_t = env::current_dir().expect("Invalid current directory").to_string_lossy().into_owned())]
     folder_path: String,
 
-    /// port number
+    /// Port number
     #[arg(short, long, default_value_t = 3000)]
     port_number: u16,
+
+    /// Parallel downloads
+    #[arg(short = 'n', long, default_value_t = 10)]
+    parallel_downloads: u16,
 }
 
 // ==========================
 // Application State
 // ==========================
-
 #[derive(Clone)]
 struct AppState {
+    host: String,
+    parallel_downloads: u16,
     root: PathBuf,
+    download_cache: Arc<Mutex<LruCache<String, Vec<String>>>>,
+}
+
+#[derive(Deserialize)]
+struct SelectionRequest {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SelectionResponse {
+    id: String,
 }
 
 // ==========================
-// Application Entry Point
+// Entry Point
 // ==========================
-
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -67,14 +86,6 @@ async fn main() {
         .canonicalize()
         .expect("Invalid path");
 
-    let state = AppState { root };
-
-    let app = Router::new()
-        .route("/", get(root_handler))
-        .route("/files/", get(root_handler))
-        .route("/files/{*path}", get(file_handler))
-        .with_state(state);
-
     let local_ip = local_ip_address::local_ip()
         .map(|i| i.to_string())
         .unwrap_or_else(|e| {
@@ -85,18 +96,36 @@ async fn main() {
             "127.0.0.1".to_string()
         });
 
+    let host = format!("http://{}:{}", local_ip, args.port_number);
+
+    let state = AppState {
+        host,
+        root,
+        parallel_downloads: args.parallel_downloads,
+        download_cache: Arc::new(Mutex::new(LruCache::new(
+            std::num::NonZeroUsize::new(100).unwrap(),
+        ))),
+    };
+
+    let app = Router::new()
+        .route("/", get(root_handler))
+        .route("/files/", get(root_handler))
+        .route("/files/{*path}", get(file_handler))
+        .route("/register-selection", post(register_selection))
+        .route("/config/{id}", get(config_handler))
+        .with_state(state);
+
     let addr = SocketAddr::from(([0, 0, 0, 0], args.port_number));
 
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| {
             eprintln!(
-                "Error: Could not bind to port {}.\nDetails: {}",
+                "Error: Could not bind to port {}. Details: {}",
                 args.port_number, e
             );
             std::process::exit(1);
-        }
-    };
+        });
 
     println!("Server running at http://{}:{}", local_ip, args.port_number);
 
@@ -111,6 +140,59 @@ async fn main() {
 // ==========================
 // Route Handlers
 // ==========================
+async fn register_selection(
+    State(state): State<AppState>,
+    Json(payload): Json<SelectionRequest>,
+) -> impl IntoResponse {
+    let SelectionRequest { files, dirs } = payload;
+
+    // Expand directories server-side
+    let mut all_files = files;
+    all_files.extend(expand_dirs(&state.root, dirs).await);
+
+    all_files.sort();
+    all_files.dedup();
+
+    let id = Uuid::new_v4().to_string();
+    let mut cache = state.download_cache.lock().unwrap();
+    cache.put(id.clone(), all_files);
+
+    Json(SelectionResponse { id })
+}
+
+async fn config_handler(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let files = {
+        let mut cache = state.download_cache.lock().unwrap();
+        cache.get(&id).cloned()
+    };
+
+    if let Some(file_list) = files {
+        let mut config = format!(
+            "globoff\ncontinue-at = -\nparallel\nparallel-max = {}\nparallel-immediate\nprogress-meter\n",
+            state.parallel_downloads
+        );
+
+        for path in file_list {
+            let escaped = escape_curl_config_value(&path);
+            config.push_str(&format!(
+                "url = \"{}/files/{}\"\noutput = \"{}\"\n\n",
+                state.host, escaped, escaped
+            ));
+        }
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            config,
+        )
+            .into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
 
 async fn root_handler(
     State(state): State<AppState>,
@@ -129,8 +211,7 @@ async fn file_handler(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    let safe_path = sanitize_path(&path);
-    let full_path = state.root.join(safe_path);
+    let full_path = state.root.join(sanitize_path(&path));
 
     if !full_path.exists() {
         return StatusCode::NOT_FOUND.into_response();
@@ -144,9 +225,8 @@ async fn file_handler(
 }
 
 // ==========================
-// Path Utilities
+// Utilities
 // ==========================
-
 fn sanitize_path(path: &str) -> PathBuf {
     Path::new(path)
         .components()
@@ -154,71 +234,122 @@ fn sanitize_path(path: &str) -> PathBuf {
         .collect()
 }
 
+pub fn escape_curl_config_value(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            ',' => out.push_str("\\,"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 // ==========================
 // Directory Rendering
 // ==========================
-
-pub async fn render_directory(dir: &Path, base: &str) -> impl axum::response::IntoResponse {
-    // Read directory asynchronously
+pub async fn render_directory(dir: &Path, base: &str) -> impl IntoResponse {
     let mut entries = tokio::fs::read_dir(dir)
         .await
         .expect("Failed to read directory");
+    let mut items: Vec<DirItem> = Vec::new();
 
-    // Preallocate Vec of HTML entries
-    let mut html_entries: Vec<String> = Vec::with_capacity(64);
-
-    // Collect HTML for each entry
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().await.is_ok_and(|ft| ft.is_dir());
         let path = if base.is_empty() {
             name.clone()
         } else {
             format!("{}/{}", base, &name)
         };
+        let link_path = format!("/files/{}", path);
 
-        // Determine icon
-        let icon = if entry.file_type().await.is_ok_and(|ft| ft.is_dir()) {
-            "📁"
-        } else {
-            "📄"
-        };
-
-        let html_line = format!("<li>{} <a href=\"/files/{}\">{}</a></li>", icon, path, name);
-        html_entries.push(html_line);
+        items.push(DirItem {
+            name,
+            path,
+            link_path,
+            is_dir,
+        });
     }
 
-    // Sort the HTML entries alphabetically by path
-    html_entries.sort();
+    items.sort_by(|a, b| UniCase::new(&a.name).cmp(&UniCase::new(&b.name)));
 
-    // Build full HTML page
-    let mut html = String::new();
-    html.push_str("<html><body>");
-    html.push_str("<h1>Directory listing</h1><ul>");
+    // Parent directory info
+    let parent = if !base.is_empty() {
+        Some(
+            Path::new(base)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
-    // Add parent link if not root
-    if !base.is_empty() {
-        let parent = Path::new(base).parent().unwrap_or(Path::new(""));
-        html.push_str(&format!(
-            "<li><a href=\"/files/{}\">[..]</a></li>",
-            parent.display()
+    Html(generate_page_html_template(parent, items))
+}
+
+struct DirItem {
+    name: String,
+    path: String,
+    link_path: String,
+    is_dir: bool,
+}
+
+impl DirItem {
+    fn to_html(&self) -> String {
+        let icon = if self.is_dir { "📁" } else { "📄" };
+        format!(
+            r#"<div class="item-row">
+                <div class="checkbox-wrapper">
+                    <input type="checkbox" class="item-check" data-path="{path}" data-is-dir="{is_dir}">
+                </div>
+                <span class="icon">{icon}</span>
+                <a class="file-link" href="{link_path}">{name}</a>
+            </div>"#,
+            path = self.path,
+            is_dir = self.is_dir,
+            icon = icon,
+            link_path = self.link_path,
+            name = self.name
+        )
+    }
+}
+
+fn generate_page_html_template(parent: Option<String>, items: Vec<DirItem>) -> String {
+    let mut content = String::new();
+
+    // Parent directory row
+    if let Some(parent_path) = parent {
+        content.push_str(&format!(
+            r#"<div class="item-row parent-row">
+                <a href="/files/{}" style="text-decoration:none; color:#666;">⤴ .. (Parent Directory)</a>
+            </div>"#,
+            parent_path
         ));
     }
 
-    // Append sorted entries
-    for entry in html_entries {
-        html.push_str(&entry);
+    // File and folder rows
+    for item in items {
+        content.push_str(&item.to_html());
     }
 
-    html.push_str("</ul></body></html>");
-    Html(html)
+    // Inject into HTML template
+    let html_template = include_str!("../index.html");
+    html_template.replace("{{CONTENT}}", &content)
 }
 
 // ==========================
 // File Serving
 // ==========================
-
 async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Response {
-    let mut file = match tokio::fs::File::open(path).await {
+    let mut file = match File::open(path).await {
         Ok(f) => f,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -244,8 +375,7 @@ async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Resp
     );
 
     if let Some(range_header) = headers.get(RANGE) {
-        let range_str = range_header.to_str().unwrap_or("");
-        if let Some((start, end)) = parse_range(range_str, file_size) {
+        if let Some((start, end)) = parse_range(range_header.to_str().unwrap_or(""), file_size) {
             info!(
                 client = %client.ip(),
                 file = %path.display(),
@@ -254,10 +384,7 @@ async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Resp
             );
 
             let length = end - start + 1;
-
-            if file.seek(SeekFrom::Start(start)).await.is_err() {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+            file.seek(SeekFrom::Start(start)).await.ok();
 
             let stream = ReaderStream::new(file.take(length));
             let body = Body::from_stream(stream);
@@ -284,7 +411,6 @@ async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Resp
 
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
-
     response_headers.insert(header::CONTENT_LENGTH, HeaderValue::from(file_size));
 
     let mut res = Response::new(body);
@@ -295,24 +421,45 @@ async fn serve_file(path: &Path, headers: HeaderMap, client: SocketAddr) -> Resp
 // ==========================
 // Range Parsing
 // ==========================
-
 fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
     if !header.starts_with("bytes=") {
         return None;
     }
-
-    let range = header.trim_start_matches("bytes=");
-    let mut parts = range.split('-');
-
+    let mut parts = header.trim_start_matches("bytes=").split('-');
     let start = parts.next()?.parse::<u64>().ok()?;
-    let end = match parts.next()?.parse::<u64>() {
-        Ok(v) => v,
-        Err(_) => size - 1,
-    };
-
+    let end = parts.next()?.parse::<u64>().unwrap_or(size - 1);
     if start <= end && end < size {
         Some((start, end))
     } else {
         None
     }
+}
+
+// ==========================
+// Directory Expansion
+// ==========================
+async fn expand_dirs(root: &Path, dirs: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut stack: Vec<PathBuf> = dirs
+        .into_iter()
+        .map(|d| root.join(sanitize_path(&d)))
+        .collect();
+
+    while let Some(path) = stack.pop() {
+        let mut rd = match fs::read_dir(&path).await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let p = entry.path();
+            if entry.file_type().await.map(|f| f.is_dir()).unwrap_or(false) {
+                stack.push(p);
+            } else if let Ok(rel) = p.strip_prefix(root) {
+                result.push(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    result.sort();
+    result
 }
